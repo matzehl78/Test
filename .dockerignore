@@ -1,0 +1,14 @@
+.git
+.github
+node_modules
+data
+test
+*.db
+*.db-*
+.env
+.env.*
+!.env.example
+Dockerfile
+docker-compose*.yml
+deploy
+*.md
