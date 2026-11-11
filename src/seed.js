@@ -52,11 +52,13 @@ const iso = (daysAgo, jitterH = 0) => new Date(Date.now() - daysAgo * 864e5 + ji
 
 export function seed(db) {
   return tx(db, () => {
+    // Demo addresses are not real inboxes: keep them out of email notifications
+    // (avoids bounces hurting the sender reputation when Resend is configured).
     const userId = (u, password) => {
       const row = db.prepare('SELECT id FROM users WHERE email = ?').get(u.email);
       if (row) return row.id;
       return Number(
-        db.prepare('INSERT INTO users (email, name, password_hash) VALUES (?, ?, ?)')
+        db.prepare('INSERT INTO users (email, name, password_hash, email_notifications) VALUES (?, ?, ?, 0)')
           .run(u.email, u.name, hashPassword(password ?? 'not-a-real-login-' + Math.random())).lastInsertRowid,
       );
     };
@@ -64,11 +66,18 @@ export function seed(db) {
     const fakeIds = FAKE_USERS.map((u) => userId(u));
     const idByName = new Map([[DEMO.name, demoId], ...FAKE_USERS.map((u, i) => [u.name, fakeIds[i]])]);
 
+    // The demo shows every feature, so it runs on Business (also upgrades a
+    // demo workspace created before billing existed). Idempotent.
+    const setBusiness = () =>
+      db.prepare("UPDATE workspaces SET plan = 'business', plan_status = 'active' WHERE slug = ?").run(WS.slug);
+
     if (db.prepare('SELECT 1 FROM workspaces WHERE slug = ?').get(WS.slug)) {
+      setBusiness();
       return { created: false };
     }
 
     const wsId = Number(db.prepare('INSERT INTO workspaces (slug, name) VALUES (?, ?)').run(WS.slug, WS.name).lastInsertRowid);
+    setBusiness();
     db.prepare("INSERT INTO memberships (workspace_id, user_id, role) VALUES (?, ?, 'owner')").run(wsId, demoId);
     const boards = new Map();
     for (const name of ['Feature Requests', 'Bugs']) {
@@ -119,7 +128,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   console.log(
     created
       ? `Demo-Daten angelegt in ${DB_FILE}`
-      : `Workspace "${WS.slug}" existiert bereits – nichts geändert (${DB_FILE})`,
+      : `Workspace "${WS.slug}" existiert bereits – nur Plan auf Business gesetzt (${DB_FILE})`,
   );
   console.log(`Login: ${DEMO.email} / ${DEMO.password}  →  http://localhost:3000/${WS.slug}`);
 }

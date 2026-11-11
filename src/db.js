@@ -95,10 +95,61 @@ CREATE TABLE IF NOT EXISTS changelog_posts (
 );
 `;
 
+// Versioned migrations on top of the base schema (PRAGMA user_version).
+// Append only — never edit a migration that has shipped.
+const MIGRATIONS = [
+  // 1: billing + email notifications
+  `
+  ALTER TABLE workspaces ADD COLUMN plan TEXT NOT NULL DEFAULT 'free';
+  ALTER TABLE workspaces ADD COLUMN plan_status TEXT NOT NULL DEFAULT 'active';
+  ALTER TABLE workspaces ADD COLUMN stripe_customer_id TEXT;
+  ALTER TABLE workspaces ADD COLUMN stripe_subscription_id TEXT;
+  ALTER TABLE workspaces ADD COLUMN current_period_end TEXT;
+  ALTER TABLE workspaces ADD COLUMN cancel_at_period_end INTEGER NOT NULL DEFAULT 0;
+  CREATE UNIQUE INDEX idx_ws_stripe_sub ON workspaces(stripe_subscription_id)
+    WHERE stripe_subscription_id IS NOT NULL;
+  CREATE INDEX idx_ws_stripe_cus ON workspaces(stripe_customer_id);
+
+  ALTER TABLE users ADD COLUMN email_notifications INTEGER NOT NULL DEFAULT 1;
+
+  CREATE TABLE app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+
+  CREATE TABLE stripe_events (
+    id          TEXT PRIMARY KEY,
+    type        TEXT NOT NULL,
+    received_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  );
+
+  CREATE TABLE email_outbox (
+    id              INTEGER PRIMARY KEY,
+    to_email        TEXT NOT NULL,
+    subject         TEXT NOT NULL,
+    text_body       TEXT NOT NULL,
+    html_body       TEXT NOT NULL,
+    headers         TEXT NOT NULL DEFAULT '{}',
+    kind            TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','sent','failed')),
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    sent_at         TEXT
+  );
+  CREATE INDEX idx_outbox_due ON email_outbox(status, next_attempt_at);
+  `,
+];
+
 export function openDb(file = ':memory:') {
   if (file !== ':memory:') mkdirSync(dirname(file), { recursive: true });
   const db = new DatabaseSync(file);
   db.exec(SCHEMA);
+  const current = db.prepare('PRAGMA user_version').get().user_version;
+  for (let v = current; v < MIGRATIONS.length; v++) {
+    tx(db, () => {
+      db.exec(MIGRATIONS[v]);
+      db.exec(`PRAGMA user_version = ${v + 1}`);
+    });
+  }
   return db;
 }
 

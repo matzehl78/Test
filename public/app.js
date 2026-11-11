@@ -98,14 +98,32 @@ function debounce(fn, ms) {
 // Toasts & API
 // ---------------------------------------------------------------------------
 
-function toast(msg, type = 'info') {
-  const el = h('div', { class: `toast ${type === 'error' ? 'error' : ''}`, role: type === 'error' ? 'alert' : 'status' }, msg);
+/** toast(msg, 'info'|'error'|'upgrade', { href, label }?) */
+function toast(msg, type = 'info', action = null) {
+  const el = h('div', { class: `toast ${type === 'info' ? '' : type}`, role: type === 'error' ? 'alert' : 'status' },
+    h('span', msg),
+    action ? h('a', { href: action.href, class: 'toast-action', onClick: () => el.remove() }, action.label) : null);
   document.getElementById('toasts').append(el);
-  setTimeout(() => el.remove(), type === 'error' ? 6000 : 3200);
+  setTimeout(() => el.remove(), action ? 9000 : type === 'error' ? 6000 : 3200);
 }
 
 class ApiError extends Error {
   constructor(status, message) { super(message); this.status = status; }
+}
+
+const UPGRADE_MESSAGES = {
+  boards: 'Mehr Boards gibt es ab Pro.',
+  admins: 'Weitere Admins gibt es ab Pro.',
+  branding: 'Eigene Farben gibt es ab Pro.',
+  csvExport: 'CSV-Export gibt es ab Pro.',
+  workspaces: 'Im Free-Plan ist ein Workspace enthalten. Upgrade einen bestehenden Workspace, um weitere anzulegen.',
+};
+
+/** Where an "Upgrade" link should point: current workspace (if admin), else the first owned one. */
+function upgradeHref() {
+  if (state.ws?.role) return `/${state.ws.workspace.slug}/admin#billing`;
+  const owned = state.me.workspaces.find((w) => w.role === 'owner');
+  return owned ? `/${owned.slug}/admin#billing` : null;
 }
 
 async function api(method, path, body, { auth = true } = {}) {
@@ -126,6 +144,17 @@ async function api(method, path, body, { auth = true } = {}) {
     navigate(`/login?next=${encodeURIComponent(next)}`);
     throw new ApiError(401, 'Bitte melde dich an');
   }
+  if (res.status === 402) {
+    // Plan limit hit: explain in German and offer the upgrade path.
+    const feature = data.details?.feature;
+    const msg = UPGRADE_MESSAGES[feature] ?? data.error ?? 'Diese Funktion ist in deinem Plan nicht enthalten.';
+    const href = upgradeHref();
+    toast(msg, 'upgrade', href ? { href, label: 'Upgrade' } : null);
+    const err = new ApiError(402, msg);
+    err.handled = true;
+    err.feature = feature;
+    throw err;
+  }
   if (!res.ok) throw new ApiError(res.status, data.error || `Fehler ${res.status}`);
   return data;
 }
@@ -136,7 +165,7 @@ async function act(btn, fn) {
   try {
     return await fn();
   } catch (e) {
-    if (e.status !== 401) toast(e.message, 'error');
+    if (e.status !== 401 && !e.handled) toast(e.message, 'error');
     return undefined;
   } finally {
     if (btn) btn.disabled = false;
@@ -173,7 +202,7 @@ async function logout() {
 function parseRoute(pathname) {
   const seg = pathname.split('/').filter(Boolean).map(decodeURIComponent);
   if (seg.length === 0) return { view: 'landing' };
-  if (seg.length === 1 && ['login', 'signup', 'new'].includes(seg[0])) return { view: seg[0] };
+  if (seg.length === 1 && ['login', 'signup', 'new', 'account'].includes(seg[0])) return { view: seg[0] };
   const [slug, sub, id] = seg;
   if (seg.length === 1) return { view: 'board', slug };
   if (sub === 'p' && id && seg.length === 3) return { view: 'post', slug, id };
@@ -194,8 +223,22 @@ document.addEventListener('click', (e) => {
   const url = new URL(a.href, location.href);
   if (url.origin !== location.origin || url.pathname.startsWith('/api/') || /\.\w+$/.test(url.pathname)) return;
   e.preventDefault();
-  if (url.pathname + url.search !== location.pathname + location.search) navigate(url.pathname + url.search);
+  if (url.pathname + url.search !== location.pathname + location.search) {
+    navigate(url.pathname + url.search + url.hash);
+  } else if (url.hash) {
+    history.pushState(null, '', url.hash);
+    scrollToHash();
+  }
 });
+
+function scrollToHash() {
+  if (!location.hash) return;
+  const el = document.getElementById(decodeURIComponent(location.hash.slice(1)));
+  if (!el) return;
+  // Offset by the sticky top bar, whose height varies (it wraps on mobile).
+  const bar = document.getElementById('topbar')?.offsetHeight ?? 0;
+  window.scrollTo(0, el.getBoundingClientRect().top + window.scrollY - bar - 12);
+}
 window.addEventListener('popstate', () => render());
 
 let renderSeq = 0;
@@ -213,7 +256,7 @@ async function render() {
       state.ws = null;
       document.documentElement.style.removeProperty('--accent');
     }
-    const views = { landing, login, signup, new: newWorkspace, board, post: postView, roadmap, changelog, admin, notfound };
+    const views = { landing, login, signup, new: newWorkspace, account, board, post: postView, roadmap, changelog, admin, notfound };
     node = await views[route.view](route);
   } catch (e) {
     if (e.status === 401) return;
@@ -224,10 +267,11 @@ async function render() {
   main.replaceChildren(node);
   document.title = pageTitle(route);
   window.scrollTo(0, 0);
+  scrollToHash();
 }
 
 function pageTitle(route) {
-  const names = { roadmap: 'Roadmap', changelog: 'Changelog', admin: 'Admin', post: 'Idee', login: 'Anmelden', signup: 'Registrieren', new: 'Neuer Workspace' };
+  const names = { roadmap: 'Roadmap', changelog: 'Changelog', admin: 'Admin', post: 'Idee', login: 'Anmelden', signup: 'Registrieren', new: 'Neuer Workspace', account: 'Konto' };
   const ws = state.ws?.workspace.name;
   const part = names[route.view];
   return [part, ws, 'Pulseboard'].filter(Boolean).join(' · ');
@@ -267,7 +311,7 @@ function renderTopbar(route) {
   const next = encodeURIComponent(location.pathname + location.search);
   const userBox = user
     ? h('div', { class: 'user' },
-        h('span', { title: user.email }, user.name),
+        h('a', { href: '/account', title: `${user.email} · Konto & Benachrichtigungen`, class: 'user-link', 'aria-current': route.view === 'account' ? 'page' : undefined }, user.name),
         h('button', { class: 'btn-link', type: 'button', onClick: logout }, 'Abmelden'))
     : h('div', { class: 'user' },
         h('a', { href: `/login?next=${next}` }, 'Anmelden'),
@@ -297,9 +341,9 @@ function landing() {
     ['🧩', 'Widget in 1 Zeile', 'Feedback-Button auf jeder Website – ein Script-Tag genügt.'],
   ];
   const plans = [
-    ['Free', '0 €', ['1 Workspace', 'Unbegrenzte Ideen & Votes', 'Öffentliche Roadmap'], false],
-    ['Pro', '19 €', ['Eigene Farben', 'Mehrere Boards', 'CSV-Export & Insights'], true],
-    ['Business', '49 €', ['Unbegrenzte Admins', 'Prioritäts-Support', 'SSO & Custom Domain (bald)'], false],
+    ['Free', '0 €', ['1 Workspace', '2 Boards', '1 Admin', 'Unbegrenzte Ideen & Votes', 'Roadmap & Changelog'], false],
+    ['Pro', '19 €', ['10 Boards', '3 Admins', 'Eigene Farben', 'CSV-Export'], true],
+    ['Business', '49 €', ['Unbegrenzte Boards', 'Unbegrenzte Admins', 'Eigene Farben & CSV-Export', 'Prioritäts-Support'], false],
   ];
   return h('div', null,
     h('section', { class: 'hero' },
@@ -506,7 +550,7 @@ async function board({ slug }) {
         ? posts.map(postRow)
         : [h('div', { class: 'card empty' }, filter.q || filter.status ? 'Keine Treffer für diese Filter.' : 'Noch keine Ideen – sei die erste Person, die etwas vorschlägt!')]));
     } catch (e) {
-      if (e.status !== 401) toast(e.message, 'error');
+      if (e.status !== 401 && !e.handled) toast(e.message, 'error');
     }
   }
 
@@ -866,6 +910,166 @@ function activityChart({ days, posts, votes }) {
       h('span', { style: { '--c': 'var(--accent)' } }, 'Neue Ideen')));
 }
 
+// ---------------------------------------------------------------------------
+// Billing
+// ---------------------------------------------------------------------------
+
+const PLAN_STATUS_LABELS = {
+  active: 'Aktiv',
+  trialing: 'Testphase',
+  past_due: 'Zahlung überfällig',
+  canceled: 'Gekündigt',
+  incomplete: 'Unvollständig',
+  incomplete_expired: 'Abgelaufen',
+  unpaid: 'Unbezahlt',
+};
+const PLAN_STATUS_COLORS = { active: 'var(--ok)', trialing: 'var(--s-planned)', past_due: 'var(--danger)' };
+
+const proBadge = () => h('span', { class: 'pro-badge', title: 'Ab Pro verfügbar' }, 'Pro');
+
+const limitText = (n, one, many) => (n === null || n === undefined ? `Unbegrenzte ${many}` : plural(n, one, many));
+
+function planFeatures(p) {
+  return [
+    p.id === 'free' ? '1 Workspace' : null,
+    limitText(p.limits.boards, 'Board', 'Boards'),
+    limitText(p.limits.admins, 'Admin', 'Admins'),
+    p.features.branding ? 'Eigene Farben' : null,
+    p.features.csvExport ? 'CSV-Export' : null,
+    p.id === 'business' ? 'Prioritäts-Support' : null,
+  ].filter(Boolean);
+}
+
+function meter(label, used, limit) {
+  const unlimited = limit === null || limit === undefined;
+  const pct = unlimited ? 4 : Math.min(100, (used / Math.max(1, limit)) * 100);
+  const full = !unlimited && used >= limit;
+  return h('div', { class: 'meter' },
+    h('div', { class: 'meter-head' },
+      h('span', label),
+      h('span', { class: 'small muted' }, unlimited ? `${used} / unbegrenzt` : `${used} / ${limit}`)),
+    h('div', {
+      class: `track ${full ? 'full' : ''}`, role: 'progressbar', 'aria-label': label,
+      'aria-valuemin': '0', 'aria-valuemax': unlimited ? undefined : String(limit), 'aria-valuenow': String(used),
+    }, h('div', { class: 'fill', style: { width: `${pct}%` } })));
+}
+
+/** Only follow http(s) redirects returned by our own API (Stripe Checkout / Portal). */
+function redirectTo(url) {
+  const u = new URL(url, location.href);
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') throw new ApiError(0, 'Ungültige Weiterleitung');
+  location.assign(u.href);
+}
+
+function billingSection(slug, billing) {
+  const current = billing.plan.id;
+  const paid = current !== 'free';
+  const canBuy = billing.canManage && billing.billingEnabled;
+  const status = billing.status;
+  const showStatus = billing.subscribedPlan !== 'free' || status !== 'active';
+
+  const checkout = (planId) => (e) => act(e.currentTarget, async () => {
+    const { url } = await api('POST', `/api/w/${slug}/billing/checkout`, { plan: planId });
+    redirectTo(url);
+  });
+  const portal = (e) => act(e.currentTarget, async () => {
+    const { url } = await api('POST', `/api/w/${slug}/billing/portal`);
+    redirectTo(url);
+  });
+
+  const cards = billing.plans.map((p) => {
+    const isCurrent = p.id === current;
+    let action = null;
+    if (isCurrent) action = h('span', { class: 'badge current-plan' }, 'Aktueller Plan');
+    else if (canBuy && !paid && p.id !== 'free') {
+      action = p.available
+        ? h('button', { type: 'button', class: 'btn-primary', onClick: checkout(p.id) }, `Upgrade auf ${p.name}`)
+        : h('span', { class: 'muted small' }, 'Derzeit nicht buchbar');
+    } else if (canBuy && paid && billing.hasCustomer) {
+      action = h('button', { type: 'button', onClick: portal }, p.id === 'free' ? 'Kündigen' : `Zu ${p.name} wechseln`);
+    }
+    return h('div', { class: `card price plan-card ${isCurrent ? 'featured' : ''}` },
+      h('h3', p.name),
+      h('div', { class: 'amount' }, `${p.priceEur} €`, h('span', { class: 'muted small' }, ' / Monat')),
+      h('ul', planFeatures(p).map((i) => h('li', '✓ ', i))),
+      action);
+  });
+
+  return h('section', { id: 'billing', class: 'card stack', 'aria-labelledby': 'billing-h' },
+    h('h2', { id: 'billing-h' }, 'Abo & Abrechnung'),
+    status === 'past_due'
+      ? h('div', { class: 'banner warn', role: 'alert' },
+          h('strong', 'Zahlung überfällig. '),
+          'Die letzte Abbuchung ist fehlgeschlagen – bitte aktualisiere deine Zahlungsmethode, damit die Pro-Funktionen erhalten bleiben.',
+          billing.canManage && billing.hasCustomer && billing.billingEnabled
+            ? h('button', { type: 'button', class: 'btn-primary', onClick: portal }, 'Zahlungsmethode aktualisieren')
+            : null)
+      : null,
+    h('div', { class: 'row' },
+      h('span', 'Aktueller Plan: ', h('strong', billing.plan.name)),
+      showStatus ? h('span', { class: 'badge', style: { '--c': PLAN_STATUS_COLORS[status] ?? 'var(--muted)' } }, PLAN_STATUS_LABELS[status] ?? status) : null,
+      billing.currentPeriodEnd && paid && !billing.cancelAtPeriodEnd
+        ? h('span', { class: 'muted small' }, 'Aktueller Zeitraum bis ', timeEl(billing.currentPeriodEnd, 'date'))
+        : null),
+    billing.cancelAtPeriodEnd && paid
+      ? h('div', { class: 'banner warn', role: 'status' },
+          h('strong', 'Abo gekündigt. '),
+          billing.currentPeriodEnd
+            ? ['Dein Plan läuft am ', timeEl(billing.currentPeriodEnd, 'date'), ' aus und wechselt dann auf Free.']
+            : 'Dein Plan läuft zum Ende des Abrechnungszeitraums aus.',
+          billing.canManage && billing.hasCustomer && billing.billingEnabled
+            ? h('button', { type: 'button', class: 'btn-primary', onClick: portal }, 'Kündigung zurücknehmen')
+            : null)
+      : null,
+    h('div', { class: 'grid grid-2 meters' },
+      meter('Boards', billing.usage.boards, billing.plan.limits.boards),
+      meter('Admins', billing.usage.admins, billing.plan.limits.admins)),
+    h('div', { class: 'grid grid-3' }, cards),
+    h('div', { class: 'row' },
+      canBuy && billing.hasCustomer && paid ? h('button', { type: 'button', onClick: portal }, 'Abo verwalten') : null,
+      canBuy && billing.hasCustomer && paid ? h('span', { class: 'muted small' }, 'Rechnungen, Zahlungsmethode und Kündigung im Stripe-Kundenportal.') : null),
+    !billing.billingEnabled ? h('p', { class: 'muted small' }, 'Abrechnung ist auf diesem Server nicht konfiguriert.') : null,
+    billing.billingEnabled && !billing.canManage ? h('p', { class: 'muted small' }, 'Nur der Owner dieses Workspaces kann das Abo ändern.') : null);
+}
+
+/** Handles the return from Stripe Checkout (?billing=success|cancel). */
+function handleCheckoutReturn(slug, billing) {
+  const params = new URLSearchParams(location.search);
+  const result = params.get('billing');
+  if (!result) return;
+  params.delete('billing');
+  const qs = params.toString();
+  history.replaceState(null, '', location.pathname + (qs ? `?${qs}` : '') + location.hash);
+  if (result === 'cancel') {
+    toast('Checkout abgebrochen');
+    return;
+  }
+  if (result !== 'success') return;
+  if (billing.plan.id !== 'free') {
+    toast('Danke! Dein Abo ist aktiv.');
+    return;
+  }
+  // The Stripe webhook can lag a few seconds behind the redirect.
+  toast('Zahlung eingegangen – dein Abo wird aktiviert …');
+  const path = location.pathname;
+  let tries = 0;
+  const poll = async () => {
+    if (location.pathname !== path) return;
+    tries++;
+    try {
+      const b = await api('GET', `/api/w/${slug}/billing`);
+      if (b.plan.id !== 'free') {
+        toast('Danke! Dein Abo ist aktiv.');
+        if (location.pathname === path) render();
+        return;
+      }
+    } catch { /* retry */ }
+    if (tries < 5) setTimeout(poll, 2000);
+    else toast('Die Aktivierung dauert länger als erwartet. Bitte lade die Seite gleich neu.', 'error');
+  };
+  setTimeout(poll, 2000);
+}
+
 async function admin({ slug }) {
   if (!state.me.user) {
     navigate(`/login?next=${encodeURIComponent(location.pathname)}`, { replace: true });
@@ -874,10 +1078,13 @@ async function admin({ slug }) {
   if (!state.ws.role) return h('div', { class: 'card empty' }, h('h1', 'Kein Zugriff'), h('p', 'Nur Admins dieses Workspaces sehen diese Seite.'));
 
   const isOwner = state.ws.role === 'owner';
-  const [stats, { members }] = await Promise.all([
+  const [stats, { members }, billing] = await Promise.all([
     api('GET', `/api/w/${slug}/stats`),
     api('GET', `/api/w/${slug}/members`),
+    api('GET', `/api/w/${slug}/billing`),
   ]);
+  const plan = billing.plan;
+  queueMicrotask(() => handleCheckoutReturn(slug, billing));
   const { totals, byStatus, activity, untriaged } = stats;
 
   const kpis = [['Ideen', totals.posts], ['Stimmen', totals.votes], ['Kommentare', totals.comments], ['Aktive Voter', totals.voters]];
@@ -885,7 +1092,8 @@ async function admin({ slug }) {
 
   // settings
   const nameIn = h('input', { value: state.ws.workspace.name, required: true, maxlength: 60 });
-  const accentIn = h('input', { type: 'color', value: state.ws.workspace.accent });
+  const canBrand = plan.features.branding;
+  const accentIn = h('input', { type: 'color', value: state.ws.workspace.accent, disabled: !canBrand, 'aria-describedby': canBrand ? undefined : 'accent-hint' });
   accentIn.addEventListener('input', () => document.documentElement.style.setProperty('--accent', accentIn.value));
   const saveBtn = h('button', { type: 'submit', class: 'btn-primary' }, 'Speichern');
   const settings = h('form', {
@@ -899,7 +1107,12 @@ async function admin({ slug }) {
         render();
       });
     },
-  }, h('h2', 'Branding'), field('Name', nameIn), field('Akzentfarbe', accentIn), saveBtn);
+  }, h('h2', 'Branding'), field('Name', nameIn),
+  h('div', { class: 'field' },
+    h('label', { for: (accentIn.id = 'accent-in') }, 'Akzentfarbe ', canBrand ? null : proBadge()),
+    accentIn,
+    canBrand ? null : h('div', { class: 'hint', id: 'accent-hint' }, 'Eigene Farben gibt es ab Pro. ', h('a', { href: '#billing' }, 'Upgrade'))),
+  saveBtn);
 
   // boards
   const boardIn = h('input', { required: true, maxlength: 40, placeholder: 'z. B. Integrationen' });
@@ -914,9 +1127,11 @@ async function admin({ slug }) {
         render();
       });
     },
-  }, h('h2', 'Boards'),
+  }, h('h2', 'Boards ', plan.limits.boards !== null && billing.usage.boards >= plan.limits.boards ? proBadge() : null),
   h('ul', state.ws.boards.map((b) => h('li', b.name, h('span', { class: 'muted small' }, ` · ${plural(b.postCount, 'Idee', 'Ideen')}`)))),
-  field('Neues Board', boardIn), boardBtn);
+  field('Neues Board', boardIn,
+    plan.limits.boards === null ? null : `${billing.usage.boards} von ${plan.limits.boards} Boards im ${plan.name}-Plan`),
+  boardBtn);
 
   // members
   const memberList = h('ul', members.map((m) => h('li', m.name, ' ', h('span', { class: 'muted small' }, `${m.email} · ${m.role === 'owner' ? 'Owner' : 'Admin'}`))));
@@ -934,7 +1149,9 @@ async function admin({ slug }) {
           toast('Admin hinzugefügt');
         });
       },
-    }, field('E-Mail', emailIn, 'Die Person muss bereits ein Konto haben.'), addBtn);
+    }, field('E-Mail', emailIn, plan.limits.admins !== null && billing.usage.admins >= plan.limits.admins
+      ? h('span', null, proBadge(), ' Weitere Admins gibt es ab Pro. ', h('a', { href: '#billing' }, 'Upgrade'))
+      : 'Die Person muss bereits ein Konto haben.'), addBtn);
   }
 
   // embed
@@ -949,7 +1166,9 @@ async function admin({ slug }) {
   return h('div', { class: 'stack' },
     h('div', { class: 'board-head' },
       h('h1', 'Admin & Insights'),
-      h('a', { href: `/api/w/${slug}/export.csv`, class: 'btn', download: '' }, '⬇ CSV-Export')),
+      plan.features.csvExport
+        ? h('a', { href: `/api/w/${slug}/export.csv`, class: 'btn', download: '' }, '⬇ CSV-Export')
+        : h('a', { href: '#billing', class: 'btn btn-locked', title: 'CSV-Export gibt es ab Pro' }, '⬇ CSV-Export ', proBadge())),
     h('div', { class: 'grid grid-4' },
       kpis.map(([label, value]) => h('div', { class: 'card kpi' }, h('div', { class: 'value' }, value.toLocaleString('de-DE')), h('div', { class: 'label' }, label)))),
     h('div', { class: 'grid grid-2' },
@@ -973,7 +1192,65 @@ async function admin({ slug }) {
       h('h2', 'Widget einbetten'),
       h('p', { class: 'muted' }, 'Füge diese Zeile vor </body> deiner Website ein – es erscheint ein Feedback-Button.'),
       h('code', { class: 'snippet' }, snippet),
-      copyBtn));
+      copyBtn),
+    billingSection(slug, billing));
+}
+
+// ---------------------------------------------------------------------------
+// Account
+// ---------------------------------------------------------------------------
+
+function account() {
+  const { user, workspaces } = state.me;
+  if (!user) {
+    navigate(`/login?next=${encodeURIComponent('/account')}`, { replace: true });
+    return h('div');
+  }
+  const nameIn = h('input', { value: user.name, required: true, maxlength: 80, autocomplete: 'name' });
+  const saveBtn = h('button', { type: 'submit', class: 'btn-primary' }, 'Speichern');
+  const notify = h('input', { type: 'checkbox', id: 'notify-in', checked: user.emailNotifications });
+  notify.addEventListener('change', () => act(notify, async () => {
+    try {
+      const { user: u } = await api('PATCH', '/api/me', { emailNotifications: notify.checked });
+      state.me.user = { ...state.me.user, ...u };
+      toast(u.emailNotifications ? 'E-Mail-Benachrichtigungen aktiviert' : 'E-Mail-Benachrichtigungen deaktiviert');
+    } catch (e) {
+      notify.checked = !notify.checked;
+      throw e;
+    }
+  }));
+
+  return h('div', { class: 'stack narrow' },
+    h('h1', 'Konto'),
+    h('form', {
+      class: 'card',
+      onSubmit: (e) => {
+        e.preventDefault();
+        act(saveBtn, async () => {
+          const { user: u } = await api('PATCH', '/api/me', { name: nameIn.value });
+          state.me.user = { ...state.me.user, ...u };
+          toast('Gespeichert');
+          render();
+        });
+      },
+    },
+    h('h2', 'Profil'),
+    h('div', { class: 'field' }, h('span', { class: 'label' }, 'E-Mail'), h('div', { class: 'muted' }, user.email)),
+    field('Name', nameIn),
+    saveBtn),
+    h('div', { class: 'card' },
+      h('h2', 'Benachrichtigungen'),
+      h('label', { class: 'check', for: 'notify-in' }, notify,
+        'E-Mail-Benachrichtigungen bei Statusänderungen, Team-Antworten und Releases'),
+      h('p', { class: 'hint' }, 'Gilt für Ideen, die du eingereicht, unterstützt oder kommentiert hast. Rechnungs-E-Mails erhalten Owner unabhängig davon.')),
+    workspaces.length
+      ? h('div', { class: 'card' },
+          h('h2', 'Deine Workspaces'),
+          h('ul', workspaces.map((w) => h('li',
+            h('a', { href: `/${w.slug}` }, w.name), ' ',
+            h('span', { class: 'muted small' }, w.role === 'owner' ? 'Owner' : 'Admin'),
+            ' · ', h('a', { href: `/${w.slug}/admin#billing`, class: 'small' }, w.role === 'owner' ? 'Abo verwalten' : 'Admin')))))
+      : null);
 }
 
 // ---------------------------------------------------------------------------

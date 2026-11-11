@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { extname, join, normalize, sep } from 'node:path';
 import {
   Router, HttpError, bad, unauthorized, forbidden, notFound,
-  readJson, parseCookies, cookie, sendJson, str, int,
+  readJson, readRaw, parseCookies, cookie, sendJson, sendHtml, str, int,
 } from './http.js';
 import {
   SESSION_COOKIE, hashPassword, verifyPassword, createSession,
@@ -10,6 +10,10 @@ import {
 } from './auth.js';
 import { findSimilar, trendingScore } from './similar.js';
 import { tx } from './db.js';
+import { PLANS, PAID_PLANS, effectivePlan, planInfo, withinLimit } from './plans.js';
+import { verifyWebhook, StripeError } from './stripe.js';
+import { getAppSecret, checkUnsubscribeToken, escapeHtml } from './mail.js';
+import { notifyStatusChange, notifyAdminComment, notifyChangelog, notifyPaymentFailed } from './notify.js';
 
 export const STATUSES = ['open', 'under_review', 'planned', 'in_progress', 'done', 'closed'];
 const ROADMAP_STATUSES = ['planned', 'in_progress', 'done'];
@@ -17,6 +21,9 @@ const SLUG_RE = /^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$/;
 const RESERVED_SLUGS = new Set(['api', 'app', 'admin', 'login', 'signup', 'new', 'static', 'widget']);
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const COLOR_RE = /^#[0-9a-fA-F]{6}$/;
+// Endpoints authenticated by something other than the session cookie
+// (Stripe signature / HMAC link token) are exempt from the JSON-CSRF rule.
+const CSRF_EXEMPT = new Set(['/api/stripe/webhook', '/api/unsubscribe']);
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -52,15 +59,28 @@ function csvCell(v) {
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
-export function createApp({ db, publicDir, secureCookies = false, authRateLimit = 20 } = {}) {
+const paymentRequired = (feature, message) => new HttpError(402, message, { feature, upgrade: true });
+
+/**
+ * stripe:  client from createStripeClient() or null (billing disabled)
+ * billing: { webhookSecret, prices: { pro, business } }  (Stripe price ids)
+ */
+export function createApp({
+  db, publicDir, secureCookies = false, authRateLimit = 20,
+  appUrl = 'http://localhost:3000', secret, stripe = null, billing = {},
+} = {}) {
   const router = new Router();
+  const mailCfg = { appUrl: appUrl.replace(/\/+$/, ''), secret: getAppSecret(db, secret) };
+  const prices = billing.prices ?? {};
+  const planByPrice = new Map(Object.entries(prices).filter(([, v]) => v).map(([k, v]) => [v, k]));
   const authLimiter = rateLimiter({ limit: authRateLimit, windowMs: 15 * 60 * 1000 });
   const writeLimiter = rateLimiter({ limit: 60, windowMs: 60 * 1000 });
 
   // ---- shared lookups -----------------------------------------------------
 
   const q = {
-    wsBySlug: db.prepare('SELECT id, slug, name, accent, created_at FROM workspaces WHERE slug = ?'),
+    wsBySlug: db.prepare('SELECT * FROM workspaces WHERE slug = ?'),
+    wsById: db.prepare('SELECT * FROM workspaces WHERE id = ?'),
     role: db.prepare('SELECT role FROM memberships WHERE workspace_id = ? AND user_id = ?'),
     post: db.prepare(
       `SELECT p.*, u.name AS author_name,
@@ -89,6 +109,18 @@ export function createApp({ db, publicDir, secureCookies = false, authRateLimit 
     workspace(ctx);
     requireUser(ctx);
     if (!ctx.role) throw forbidden('Admin access required');
+  }
+
+  function requireOwner(ctx) {
+    requireAdmin(ctx);
+    if (ctx.role !== 'owner') throw forbidden('Only the workspace owner can do this');
+  }
+
+  function usage(wsId) {
+    return {
+      boards: db.prepare('SELECT COUNT(*) AS n FROM boards WHERE workspace_id = ?').get(wsId).n,
+      admins: db.prepare('SELECT COUNT(*) AS n FROM memberships WHERE workspace_id = ?').get(wsId).n,
+    };
   }
 
   function rateLimit(ctx, limiter, scope) {
@@ -208,7 +240,55 @@ export function createApp({ db, publicDir, secureCookies = false, authRateLimit 
          JOIN workspaces w ON w.id = m.workspace_id
         WHERE m.user_id = ? ORDER BY w.name`,
     ).all(ctx.user.id);
-    return { user: ctx.user, workspaces };
+    const { email_notifications: n } = db.prepare('SELECT email_notifications FROM users WHERE id = ?').get(ctx.user.id);
+    return { user: { ...ctx.user, emailNotifications: Boolean(n) }, workspaces };
+  });
+
+  router.patch('/api/me', async (ctx) => {
+    const user = requireUser(ctx);
+    const b = await readJson(ctx.req);
+    if (b.emailNotifications !== undefined) {
+      if (typeof b.emailNotifications !== 'boolean') throw bad('emailNotifications must be a boolean');
+      db.prepare('UPDATE users SET email_notifications = ? WHERE id = ?').run(b.emailNotifications ? 1 : 0, user.id);
+    }
+    if (b.name !== undefined) {
+      db.prepare('UPDATE users SET name = ? WHERE id = ?').run(str(b.name, 'name', { max: 80 }), user.id);
+    }
+    const row = db.prepare('SELECT id, email, name, email_notifications FROM users WHERE id = ?').get(user.id);
+    return { user: { id: row.id, email: row.email, name: row.name, emailNotifications: Boolean(row.email_notifications) } };
+  });
+
+  // One-click unsubscribe from email links. GET shows a confirmation page
+  // (mail scanners prefetch links), POST performs it (RFC 8058 one-click).
+  function unsubscribeUser(ctx) {
+    const userId = Number(ctx.url.searchParams.get('u'));
+    const token = ctx.url.searchParams.get('t');
+    if (!Number.isInteger(userId) || !checkUnsubscribeToken(mailCfg.secret, userId, token)) {
+      sendHtml(ctx.res, 400, page('Link ungültig',
+        '<p>Dieser Abmelde-Link ist ungültig oder unvollständig. Du kannst Benachrichtigungen jederzeit in deinem <a href="/account">Konto</a> abschalten.</p>'));
+      return null;
+    }
+    return userId;
+  }
+  const page = (title, body) => `<!doctype html><html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title>
+<link rel="stylesheet" href="/app.css"></head><body><main class="container narrow" style="padding:48px 16px">
+<div class="card"><h1>${escapeHtml(title)}</h1>${body}</div></main></body></html>`;
+
+  router.get('/api/unsubscribe', (ctx) => {
+    if (unsubscribeUser(ctx) === null) return;
+    const action = `/api/unsubscribe?${new URLSearchParams({ u: ctx.url.searchParams.get('u'), t: ctx.url.searchParams.get('t') })}`;
+    sendHtml(ctx.res, 200, page('E-Mails abbestellen',
+      `<p>Möchtest du keine Benachrichtigungen mehr zu Ideen erhalten?</p>
+<form method="post" action="${escapeHtml(action)}"><button class="btn-primary" type="submit">Abbestellen</button></form>`));
+  });
+
+  router.post('/api/unsubscribe', (ctx) => {
+    const userId = unsubscribeUser(ctx);
+    if (userId === null) return;
+    db.prepare('UPDATE users SET email_notifications = 0 WHERE id = ?').run(userId);
+    sendHtml(ctx.res, 200, page('Abbestellt',
+      '<p>Du erhältst keine Benachrichtigungen mehr. Du kannst sie jederzeit in deinem Konto wieder aktivieren.</p><p><a href="/account">Zum Konto</a></p>'));
   });
 
   // ---- workspaces ---------------------------------------------------------
@@ -223,6 +303,13 @@ export function createApp({ db, publicDir, secureCookies = false, authRateLimit 
       throw bad('slug must be 3–40 chars: lowercase letters, digits and dashes');
     }
     if (q.wsBySlug.get(slug)) throw new HttpError(409, 'This URL is already taken');
+    const freeOwned = db.prepare(
+      `SELECT w.* FROM memberships m JOIN workspaces w ON w.id = m.workspace_id
+        WHERE m.user_id = ? AND m.role = 'owner'`,
+    ).all(user.id).filter((w) => effectivePlan(w) === 'free').length;
+    if (!withinLimit(PLANS.free.limits.ownedWorkspaces, freeOwned)) {
+      throw paymentRequired('workspaces', 'The Free plan includes one workspace. Upgrade an existing workspace to create more.');
+    }
     tx(db, () => {
       const wsId = Number(
         db.prepare('INSERT INTO workspaces (slug, name) VALUES (?, ?)').run(slug, name).lastInsertRowid,
@@ -246,6 +333,7 @@ export function createApp({ db, publicDir, secureCookies = false, authRateLimit 
       boards,
       role: ctx.role,
       statuses: STATUSES,
+      ...(ctx.role ? { plan: planInfo(ws) } : {}),
     };
   });
 
@@ -255,6 +343,9 @@ export function createApp({ db, publicDir, secureCookies = false, authRateLimit 
     const name = b.name !== undefined ? str(b.name, 'name', { max: 60 }) : ctx.ws.name;
     const accent = b.accent !== undefined ? String(b.accent) : ctx.ws.accent;
     if (!COLOR_RE.test(accent)) throw bad('accent must be a hex color like #5b5bd6');
+    if (accent.toLowerCase() !== ctx.ws.accent.toLowerCase() && !planInfo(ctx.ws).features.branding) {
+      throw paymentRequired('branding', 'Custom colors are available on Pro and Business.');
+    }
     db.prepare('UPDATE workspaces SET name = ?, accent = ? WHERE id = ?').run(name, accent, ctx.ws.id);
     return { workspace: { slug: ctx.ws.slug, name, accent } };
   });
@@ -275,6 +366,10 @@ export function createApp({ db, publicDir, secureCookies = false, authRateLimit 
     const email = str(b.email, 'email', { max: 254 }).toLowerCase();
     const user = db.prepare('SELECT id, name, email FROM users WHERE email = ?').get(email);
     if (!user) throw notFound('No user with this email — they need to sign up first');
+    const plan = planInfo(ctx.ws);
+    if (!q.role.get(ctx.ws.id, user.id) && !withinLimit(plan.limits.admins, usage(ctx.ws.id).admins)) {
+      throw paymentRequired('admins', `The ${plan.name} plan allows ${plan.limits.admins} admin(s). Upgrade to add more.`);
+    }
     db.prepare(
       "INSERT OR IGNORE INTO memberships (workspace_id, user_id, role) VALUES (?, ?, 'admin')",
     ).run(ctx.ws.id, user.id);
@@ -285,6 +380,10 @@ export function createApp({ db, publicDir, secureCookies = false, authRateLimit 
     requireAdmin(ctx);
     const b = await readJson(ctx.req);
     const name = str(b.name, 'name', { max: 40 });
+    const plan = planInfo(ctx.ws);
+    if (!withinLimit(plan.limits.boards, usage(ctx.ws.id).boards)) {
+      throw paymentRequired('boards', `The ${plan.name} plan allows ${plan.limits.boards} boards. Upgrade to add more.`);
+    }
     try {
       const id = Number(
         db.prepare('INSERT INTO boards (workspace_id, name) VALUES (?, ?)').run(ctx.ws.id, name).lastInsertRowid,
@@ -394,6 +493,9 @@ export function createApp({ db, publicDir, secureCookies = false, authRateLimit 
       if (next.status !== row.status) {
         db.prepare('INSERT INTO post_events (post_id, actor_id, from_status, to_status) VALUES (?, ?, ?, ?)')
           .run(row.id, user.id, row.status, next.status);
+        notifyStatusChange(db, mailCfg, {
+          ws: ctx.ws, post: { id: row.id, title: next.title }, from: row.status, to: next.status, actorId: user.id,
+        });
       }
     });
     return { post: postDto(q.post.get(row.id, ctx.ws.id), ctx) };
@@ -428,10 +530,14 @@ export function createApp({ db, publicDir, secureCookies = false, authRateLimit 
     const b = await readJson(ctx.req);
     const body = str(b.body, 'body', { max: 3000 });
     const isAdmin = ctx.role ? 1 : 0;
-    const id = Number(
-      db.prepare('INSERT INTO comments (post_id, author_id, body, is_admin) VALUES (?, ?, ?, ?)')
-        .run(row.id, user.id, body, isAdmin).lastInsertRowid,
-    );
+    const id = tx(db, () => {
+      const cid = Number(
+        db.prepare('INSERT INTO comments (post_id, author_id, body, is_admin) VALUES (?, ?, ?, ?)')
+          .run(row.id, user.id, body, isAdmin).lastInsertRowid,
+      );
+      if (isAdmin) notifyAdminComment(db, mailCfg, { ws: ctx.ws, post: row, comment: body, actor: user });
+      return cid;
+    });
     const c = db.prepare('SELECT created_at FROM comments WHERE id = ?').get(id);
     return [201, { comment: { id, body, isAdmin: Boolean(isAdmin), authorName: user.name, createdAt: c.created_at } }];
   });
@@ -470,8 +576,9 @@ export function createApp({ db, publicDir, secureCookies = false, authRateLimit 
         db.prepare('INSERT INTO changelog (workspace_id, title, body) VALUES (?, ?, ?)')
           .run(ctx.ws.id, title, body).lastInsertRowid,
       );
+      const shipped = [];
       for (const pid of postIds) {
-        const p = db.prepare('SELECT id, status FROM posts WHERE id = ? AND workspace_id = ?').get(pid, ctx.ws.id);
+        const p = db.prepare('SELECT id, title, status FROM posts WHERE id = ? AND workspace_id = ?').get(pid, ctx.ws.id);
         if (!p) throw bad(`Unknown post ${pid}`);
         db.prepare('INSERT INTO changelog_posts (changelog_id, post_id) VALUES (?, ?)').run(cid, pid);
         // Shipping an idea closes the loop: linked posts become "done".
@@ -480,7 +587,10 @@ export function createApp({ db, publicDir, secureCookies = false, authRateLimit 
           db.prepare("INSERT INTO post_events (post_id, actor_id, from_status, to_status) VALUES (?, ?, ?, 'done')")
             .run(pid, ctx.user.id, p.status);
         }
+        shipped.push(p);
       }
+      // One digest email per subscriber instead of one per status change.
+      notifyChangelog(db, mailCfg, { ws: ctx.ws, entry: { title, body }, posts: shipped, actorId: ctx.user.id });
       return cid;
     });
     return [201, { entry: { id, title, body, postIds } }];
@@ -527,6 +637,9 @@ export function createApp({ db, publicDir, secureCookies = false, authRateLimit 
 
   router.get('/api/w/:slug/export.csv', (ctx) => {
     requireAdmin(ctx);
+    if (!planInfo(ctx.ws).features.csvExport) {
+      throw paymentRequired('csvExport', 'CSV export is available on Pro and Business.');
+    }
     const rows = db.prepare(
       `SELECT p.id, b.name AS board, p.title, p.body, p.status, u.name AS author, p.created_at,
               (SELECT COUNT(*) FROM votes v WHERE v.post_id = p.id) AS votes,
@@ -543,6 +656,172 @@ export function createApp({ db, publicDir, secureCookies = false, authRateLimit 
     });
     ctx.res.end('﻿' + csv);
     return undefined;
+  });
+
+  // ---- billing (Stripe) ---------------------------------------------------
+
+  function requireBilling() {
+    if (!stripe) throw new HttpError(503, 'Billing is not configured on this server');
+  }
+
+  router.get('/api/w/:slug/billing', (ctx) => {
+    requireAdmin(ctx);
+    const ws = ctx.ws;
+    return {
+      plan: planInfo(ws),
+      status: ws.plan_status,
+      subscribedPlan: ws.plan,
+      currentPeriodEnd: ws.current_period_end,
+      cancelAtPeriodEnd: Boolean(ws.cancel_at_period_end),
+      hasCustomer: Boolean(ws.stripe_customer_id),
+      usage: usage(ws.id),
+      plans: Object.entries(PLANS).map(([id, p]) => ({ id, ...p, available: id === 'free' || Boolean(prices[id]) })),
+      billingEnabled: Boolean(stripe),
+      canManage: ctx.role === 'owner',
+    };
+  });
+
+  router.post('/api/w/:slug/billing/checkout', async (ctx) => {
+    requireOwner(ctx);
+    requireBilling();
+    const b = await readJson(ctx.req);
+    if (!PAID_PLANS.includes(b.plan)) throw bad('plan must be "pro" or "business"');
+    const price = prices[b.plan];
+    if (!price) throw new HttpError(503, `No Stripe price configured for ${b.plan}`);
+    const ws = ctx.ws;
+    if (effectivePlan(ws) !== 'free' && ws.stripe_subscription_id) {
+      throw new HttpError(409, 'This workspace already has a subscription — use the billing portal to change it');
+    }
+    try {
+      let customer = ws.stripe_customer_id;
+      if (!customer) {
+        // Idempotency key: double clicks must not create two customers.
+        customer = (await stripe.createCustomer(
+          { email: ctx.user.email, name: ws.name, metadata: { workspace_id: ws.id, slug: ws.slug } },
+          `pb-customer-ws-${ws.id}`,
+        )).id;
+        db.prepare('UPDATE workspaces SET stripe_customer_id = ? WHERE id = ?').run(customer, ws.id);
+      }
+      const base = `${mailCfg.appUrl}/${ws.slug}/admin`;
+      const session = await stripe.createCheckoutSession({
+        mode: 'subscription',
+        customer,
+        client_reference_id: String(ws.id),
+        line_items: [{ price, quantity: 1 }],
+        metadata: { workspace_id: ws.id, plan: b.plan },
+        subscription_data: { metadata: { workspace_id: ws.id, plan: b.plan } },
+        allow_promotion_codes: true,
+        billing_address_collection: 'required',
+        tax_id_collection: { enabled: true },
+        customer_update: { address: 'auto', name: 'auto' },
+        success_url: `${base}?billing=success#billing`,
+        cancel_url: `${base}?billing=cancel#billing`,
+      });
+      return { url: session.url };
+    } catch (e) {
+      if (e instanceof StripeError) throw new HttpError(502, `Payment provider error: ${e.message}`);
+      throw e;
+    }
+  });
+
+  router.post('/api/w/:slug/billing/portal', async (ctx) => {
+    requireOwner(ctx);
+    requireBilling();
+    if (!ctx.ws.stripe_customer_id) throw bad('No billing account yet — choose a plan first');
+    try {
+      const session = await stripe.createPortalSession({
+        customer: ctx.ws.stripe_customer_id,
+        return_url: `${mailCfg.appUrl}/${ctx.ws.slug}/admin#billing`,
+      });
+      return { url: session.url };
+    } catch (e) {
+      if (e instanceof StripeError) throw new HttpError(502, `Payment provider error: ${e.message}`);
+      throw e;
+    }
+  });
+
+  function findWorkspaceForStripe(obj) {
+    const metaId = Number(obj.metadata?.workspace_id);
+    if (Number.isInteger(metaId) && metaId > 0) {
+      const ws = q.wsById.get(metaId);
+      if (ws) return ws;
+    }
+    if (obj.subscription || obj.object === 'subscription') {
+      const subId = obj.object === 'subscription' ? obj.id : obj.subscription;
+      const ws = db.prepare('SELECT * FROM workspaces WHERE stripe_subscription_id = ?').get(subId);
+      if (ws) return ws;
+    }
+    if (obj.customer) return db.prepare('SELECT * FROM workspaces WHERE stripe_customer_id = ?').get(obj.customer) ?? null;
+    return null;
+  }
+
+  const ENDED = new Set(['canceled', 'unpaid', 'incomplete_expired']);
+
+  function applySubscription(ws, sub) {
+    const item = sub.items?.data?.[0];
+    const plan = planByPrice.get(item?.price?.id) ?? (PAID_PLANS.includes(sub.metadata?.plan) ? sub.metadata.plan : null);
+    const periodEnd = sub.current_period_end ?? item?.current_period_end;
+    const ended = ENDED.has(sub.status);
+    db.prepare(
+      `UPDATE workspaces SET plan = ?, plan_status = ?, stripe_subscription_id = ?,
+              stripe_customer_id = COALESCE(?, stripe_customer_id), current_period_end = ?,
+              cancel_at_period_end = ? WHERE id = ?`,
+    ).run(
+      ended || !plan ? 'free' : plan,
+      sub.status,
+      ended ? null : sub.id,
+      sub.customer ?? null,
+      periodEnd ? new Date(periodEnd * 1000).toISOString() : null,
+      // Newer API versions may express a scheduled cancel only via cancel_at.
+      !ended && (sub.cancel_at_period_end || sub.cancel_at) ? 1 : 0,
+      ws.id,
+    );
+  }
+
+  router.post('/api/stripe/webhook', async (ctx) => {
+    if (!billing.webhookSecret) throw new HttpError(503, 'Stripe webhook secret not configured');
+    const raw = await readRaw(ctx.req);
+    let event;
+    try {
+      event = verifyWebhook(raw, ctx.req.headers['stripe-signature'], billing.webhookSecret);
+    } catch (e) {
+      throw bad(e.message);
+    }
+    const obj = event.data?.object ?? {};
+    const handled = tx(db, () => {
+      // Stripe delivers at-least-once: dedupe by event id in the same transaction.
+      const fresh = db.prepare('INSERT OR IGNORE INTO stripe_events (id, type) VALUES (?, ?)').run(event.id, event.type);
+      if (!fresh.changes) return 'duplicate';
+      const ws = findWorkspaceForStripe(obj);
+      if (!ws) return 'ignored';
+      switch (event.type) {
+        case 'checkout.session.completed':
+          if (obj.mode !== 'subscription') return 'ignored';
+          db.prepare(
+            `UPDATE workspaces SET plan = ?, plan_status = 'active', stripe_customer_id = ?,
+                    stripe_subscription_id = ? WHERE id = ?`,
+          ).run(PAID_PLANS.includes(obj.metadata?.plan) ? obj.metadata.plan : 'pro', obj.customer, obj.subscription, ws.id);
+          return 'ok';
+        case 'customer.subscription.created':
+        case 'customer.subscription.updated':
+          // Ignore events for a subscription that has since been replaced.
+          if (ws.stripe_subscription_id && ws.stripe_subscription_id !== obj.id && ENDED.has(obj.status)) return 'ignored';
+          applySubscription(ws, obj);
+          return 'ok';
+        case 'customer.subscription.deleted':
+          if (ws.stripe_subscription_id && ws.stripe_subscription_id !== obj.id) return 'ignored';
+          db.prepare(
+            "UPDATE workspaces SET plan = 'free', plan_status = 'canceled', stripe_subscription_id = NULL, current_period_end = NULL, cancel_at_period_end = 0 WHERE id = ?",
+          ).run(ws.id);
+          return 'ok';
+        case 'invoice.payment_failed':
+          notifyPaymentFailed(db, mailCfg, { ws });
+          return 'ok';
+        default:
+          return 'ignored';
+      }
+    });
+    return { received: true, result: handled };
   });
 
   router.get('/api/health', () => ({ ok: true }));
@@ -581,7 +860,7 @@ export function createApp({ db, publicDir, secureCookies = false, authRateLimit 
         if (m.methodNotAllowed) throw new HttpError(405, 'Method not allowed');
         // CSRF: every state-changing call must be JSON (forces a CORS preflight),
         // including body-less ones like vote, logout and delete.
-        if (req.method !== 'GET' && req.method !== 'HEAD' &&
+        if (req.method !== 'GET' && req.method !== 'HEAD' && !CSRF_EXEMPT.has(url.pathname) &&
             !(req.headers['content-type'] || '').startsWith('application/json')) {
           throw new HttpError(415, 'Content-Type must be application/json');
         }

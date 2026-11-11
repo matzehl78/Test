@@ -7,10 +7,37 @@ import { join } from 'node:path';
 import { request as httpRequest } from 'node:http';
 import { openDb } from '../src/db.js';
 import { createApp } from '../src/app.js';
+import { signPayload } from '../src/stripe.js';
+
+const WEBHOOK_SECRET = 'whsec_test';
+const BILLING = { webhookSecret: WEBHOOK_SECRET, prices: { pro: 'price_pro', business: 'price_biz' } };
 
 function startServer(opts = {}) {
-  const srv = createServer(createApp({ db: openDb(), authRateLimit: 1000, ...opts }));
-  return new Promise((r) => srv.listen(0, () => r({ srv, base: `http://localhost:${srv.address().port}` })));
+  const db = opts.db ?? openDb();
+  const srv = createServer(createApp({ db, authRateLimit: 1000, billing: BILLING, ...opts }));
+  return new Promise((r) => srv.listen(0, () => r({ srv, db, base: `http://localhost:${srv.address().port}` })));
+}
+
+/** Upgrades a workspace the realistic way: a signed Stripe checkout webhook. */
+let evtN = 0;
+async function upgrade(slug, plan = 'pro') {
+  const { id } = db.prepare('SELECT id FROM workspaces WHERE slug = ?').get(slug);
+  const raw = JSON.stringify({
+    id: `evt_api_${++evtN}`,
+    type: 'checkout.session.completed',
+    data: { object: {
+      object: 'checkout.session', mode: 'subscription', client_reference_id: String(id),
+      customer: `cus_${id}`, subscription: `sub_${id}`, metadata: { workspace_id: String(id), plan },
+    } },
+  });
+  const t = Math.floor(Date.now() / 1000);
+  const res = await fetch(`${base}/api/stripe/webhook`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'stripe-signature': `t=${t},v1=${signPayload(raw, WEBHOOK_SECRET, t)}` },
+    body: raw,
+  });
+  assert.equal(res.status, 200, await res.clone().text());
+  assert.equal((await res.json()).result, 'ok');
 }
 
 function client(base) {
@@ -39,8 +66,8 @@ function client(base) {
   return c;
 }
 
-let srv, base;
-before(async () => ({ srv, base } = await startServer()));
+let srv, base, db;
+before(async () => ({ srv, base, db } = await startServer()));
 after(() => srv.close());
 
 let n = 0;
@@ -167,6 +194,7 @@ describe('workspaces', () => {
   test('admin settings: accent validation, board creation, non-admin forbidden', async () => {
     const owner = await newUser();
     const ws = await newWorkspace(owner, 'Settings');
+    await upgrade(ws.slug); // accent colours + 3rd board are Pro features
     assert.equal((await owner('PATCH', `/api/w/${ws.slug}`, { accent: 'red' })).status, 400);
     assert.equal((await owner('PATCH', `/api/w/${ws.slug}`, { accent: '#112233' })).body.workspace.accent, '#112233');
     assert.equal((await owner('POST', `/api/w/${ws.slug}/boards`, { name: 'Ideas' })).status, 201);
@@ -180,6 +208,7 @@ describe('workspaces', () => {
   test('only the owner can add admins', async () => {
     const owner = await newUser();
     const ws = await newWorkspace(owner, 'Team');
+    await upgrade(ws.slug); // Free allows only the owner as admin
     const admin = await newUser();
     const stranger = await newUser();
     assert.equal((await owner('POST', `/api/w/${ws.slug}/members`, { email: 'nobody@x.de' })).status, 404);
@@ -408,6 +437,7 @@ describe('roadmap, changelog, stats, export', () => {
   test('CSV export with formula-injection guard', async () => {
     const owner = await newUser();
     const ws = await newWorkspace(owner, 'Export');
+    await upgrade(ws.slug); // CSV export is a Pro feature
     await newPost(owner, ws, '=HYPERLINK("http://evil")', 'line1\nline2, "quoted"');
     await newPost(owner, ws, 'Normal title');
     assert.equal((await (await newUser())('GET', `/api/w/${ws.slug}/export.csv`)).status, 403);

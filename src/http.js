@@ -125,3 +125,20 @@ export function int(v, field) {
   if (!Number.isInteger(n) || n <= 0) throw bad(`${field} must be a positive integer`);
   return n;
 }
+
+/** Reads the raw request body (needed for webhook signature checks). */
+export async function readRaw(req, max = 512 * 1024) {
+  let size = 0;
+  const chunks = [];
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > max) throw new HttpError(413, 'Body too large');
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+export function sendHtml(res, status, html) {
+  res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+  res.end(html);
+}
