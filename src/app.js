@@ -59,6 +59,19 @@ function csvCell(v) {
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
+/**
+ * Client IP for rate limiting. With trustProxy = N, the N-th entry from the
+ * right of X-Forwarded-For is used (the one appended by our own outermost
+ * proxy); left-most entries are client-controlled and never trusted.
+ */
+export function clientIp(req, trustProxy = 0) {
+  const socketIp = req.socket?.remoteAddress ?? 'unknown';
+  if (!trustProxy) return socketIp;
+  const chain = String(req.headers['x-forwarded-for'] || '')
+    .split(',').map((s) => s.trim()).filter(Boolean);
+  return chain.length >= trustProxy ? chain[chain.length - trustProxy] : socketIp;
+}
+
 const paymentRequired = (feature, message) => new HttpError(402, message, { feature, upgrade: true });
 
 /**
@@ -68,6 +81,7 @@ const paymentRequired = (feature, message) => new HttpError(402, message, { feat
 export function createApp({
   db, publicDir, secureCookies = false, authRateLimit = 20,
   appUrl = 'http://localhost:3000', secret, stripe = null, billing = {},
+  trustProxy = 0,
 } = {}) {
   const router = new Router();
   const mailCfg = { appUrl: appUrl.replace(/\/+$/, ''), secret: getAppSecret(db, secret) };
@@ -824,7 +838,10 @@ export function createApp({
     return { received: true, result: handled };
   });
 
-  router.get('/api/health', () => ({ ok: true }));
+  router.get('/api/health', () => {
+    db.prepare('SELECT 1').get(); // throws → 500 if the database is unusable
+    return { ok: true };
+  });
 
   // ---- static files -------------------------------------------------------
 
@@ -868,7 +885,7 @@ export function createApp({
         const ctx = {
           req, res, url, cookies,
           params: m.params,
-          ip: req.socket?.remoteAddress ?? 'unknown',
+          ip: clientIp(req, trustProxy),
           user: userFromToken(db, cookies[SESSION_COOKIE]),
         };
         const out = await m.handler(ctx);

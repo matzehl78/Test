@@ -4,12 +4,15 @@
   "description": "Feedback, roadmap and changelog SaaS — zero runtime dependencies",
   "type": "module",
   "private": true,
-  "engines": { "node": ">=22.5" },
+  "engines": {
+    "node": ">=22.5"
+  },
   "scripts": {
     "start": "node --disable-warning=ExperimentalWarning src/server.js",
     "dev": "node --disable-warning=ExperimentalWarning --watch src/server.js",
     "seed": "node --disable-warning=ExperimentalWarning src/seed.js",
-    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js"
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js",
+    "backup": "node --disable-warning=ExperimentalWarning src/backup.js"
   },
   "license": "MIT"
 }

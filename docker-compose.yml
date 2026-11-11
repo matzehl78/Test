@@ -1,0 +1,71 @@
+# Production stack: app + Caddy (HTTPS) + daily SQLite backups.
+#   cp .env.example .env   # fill in DOMAIN, APP_URL, secrets
+#   docker compose up -d --build
+name: pulseboard
+
+services:
+  app:
+    build: .
+    image: pulseboard:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      DB_FILE: /data/pulseboard.db
+      BACKUP_DIR: /data/backups
+      TRUST_PROXY: "1"            # exactly one proxy (Caddy) in front
+    volumes:
+      - pb-data:/data
+    expose:
+      - "3000"
+    stop_grace_period: 20s
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+
+  caddy:
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      DOMAIN: ${DOMAIN:?DOMAIN must be set in .env}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+  backup:
+    build: .
+    image: pulseboard:latest
+    restart: unless-stopped
+    depends_on: [app]
+    environment:
+      DB_FILE: /data/pulseboard.db
+      BACKUP_DIR: /data/backups
+      BACKUP_KEEP: "14"
+    volumes:
+      - pb-data:/data
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while true; do
+          node --disable-warning=ExperimentalWarning src/backup.js || echo "[backup] failed"
+          sleep 86400
+        done
+    healthcheck:
+      disable: true
+
+volumes:
+  pb-data:
+  caddy-data:
+  caddy-config:

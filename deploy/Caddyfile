@@ -1,0 +1,21 @@
+# Caddy terminates TLS (automatic Let's Encrypt certificates) and proxies to the app.
+{$DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		-Server
+	}
+
+	# Stripe webhooks and normal traffic go to the same app.
+	reverse_proxy app:3000 {
+		# Retry briefly while the app restarts (e.g. during updates) instead of failing fast.
+		lb_try_duration 10s
+		lb_try_interval 250ms
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

@@ -35,6 +35,7 @@ const app = createApp({
   appUrl: APP_URL,
   secret: env.APP_SECRET,
   stripe,
+  trustProxy: Number(env.TRUST_PROXY) || 0,
   billing: {
     webhookSecret: env.STRIPE_WEBHOOK_SECRET,
     prices: { pro: env.STRIPE_PRICE_PRO, business: env.STRIPE_PRICE_BUSINESS },

@@ -138,6 +138,15 @@ Pulseboard schließt den Feedback-Kreis per E-Mail an alle, die einer Idee folge
 
 **Abmelden**: Jede Mail enthält einen signierten Abmelde-Link sowie die Header `List-Unsubscribe` und `List-Unsubscribe-Post` für **One-Click-Unsubscribe nach RFC 8058** (Gmail/Yahoo-Pflicht für Massenversender). `GET /api/unsubscribe` zeigt nur eine Bestätigungsseite (Mail-Scanner rufen Links vorab auf), erst `POST` meldet ab. Nutzer können Benachrichtigungen auch über `PATCH /api/me {"emailNotifications": false}` steuern.
 
+## Deployment
+
+Produktionsbetrieb mit Docker Compose (inkl. automatischem HTTPS über Caddy und täglichen Backups) oder Fly.io: siehe **[DEPLOY.md](DEPLOY.md)**.
+
+```bash
+cp .env.example .env    # DOMAIN, APP_URL, Secrets eintragen
+docker compose up -d --build
+```
+
 ## Architektur
 
 ```
