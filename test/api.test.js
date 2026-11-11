@@ -17,7 +17,10 @@ function client(base) {
   let jar = '';
   const c = async (method, path, body, { contentType = 'application/json', raw = false } = {}) => {
     const headers = { cookie: jar };
-    if (body !== undefined) headers['content-type'] = contentType;
+    // Mirrors the frontend: every mutation is sent as JSON (CSRF defence).
+    if (contentType && (body !== undefined || (method !== 'GET' && method !== 'HEAD'))) {
+      headers['content-type'] = contentType;
+    }
     const res = await fetch(base + path, {
       method,
       headers,
@@ -116,6 +119,16 @@ describe('auth', () => {
     const c = client(base);
     const r = await c('POST', '/api/auth/login', 'email=a&password=b', { contentType: 'application/x-www-form-urlencoded' });
     assert.equal(r.status, 415);
+  });
+
+  test('body-less mutations without JSON content-type → 415 (CSRF)', async () => {
+    const u = await newUser();
+    const ws = await newWorkspace(u, 'Csrf');
+    const p = await newPost(u, ws, 'Csrf protected idea');
+    assert.equal((await u('POST', `/api/w/${ws.slug}/posts/${p.id}/vote`, undefined, { contentType: null })).status, 415);
+    assert.equal((await u('DELETE', `/api/w/${ws.slug}/posts/${p.id}`, undefined, { contentType: null })).status, 415);
+    assert.equal((await u('POST', '/api/auth/logout', undefined, { contentType: null })).status, 415);
+    assert.equal((await u('POST', `/api/w/${ws.slug}/posts/${p.id}/vote`)).status, 200);
   });
 
   test('invalid JSON → 400, array body → 400', async () => {

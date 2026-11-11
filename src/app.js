@@ -317,7 +317,11 @@ export function createApp({ db, publicDir, secureCookies = false, authRateLimit 
     const rows = listPosts(ctx).filter((r) => r.status !== 'closed');
     const hits = findSimilar(text, rows);
     return {
-      posts: hits.map((h) => ({ id: h.id, title: h.title, status: h.status, votes: h.votes, score: +h.score.toFixed(2) })),
+      posts: hits.map((h) => ({
+        id: h.id, title: h.title, status: h.status, votes: h.votes,
+        hasVoted: ctx.user ? Boolean(q.hasVoted.get(h.id, ctx.user.id)) : false,
+        score: +h.score.toFixed(2),
+      })),
     };
   });
 
@@ -575,6 +579,12 @@ export function createApp({ db, publicDir, secureCookies = false, authRateLimit 
         const m = router.match(req.method, url.pathname);
         if (!m) throw notFound('Unknown endpoint');
         if (m.methodNotAllowed) throw new HttpError(405, 'Method not allowed');
+        // CSRF: every state-changing call must be JSON (forces a CORS preflight),
+        // including body-less ones like vote, logout and delete.
+        if (req.method !== 'GET' && req.method !== 'HEAD' &&
+            !(req.headers['content-type'] || '').startsWith('application/json')) {
+          throw new HttpError(415, 'Content-Type must be application/json');
+        }
         const cookies = parseCookies(req.headers.cookie);
         const ctx = {
           req, res, url, cookies,
